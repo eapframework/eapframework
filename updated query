@@ -1,0 +1,333 @@
+-- ============================================================================
+-- PIPELINE:  NetAudit_project
+-- FORMAT:    Standard Databricks Unity Catalog SQL (no DLT dependency)
+-- ============================================================================
+-- INSTRUCTIONS:
+--   1. Replace ${catalog} and ${schema} with your actual catalog/schema names
+--      OR run: SET catalog = your_catalog; SET schema = your_schema;
+--   2. Replace source.* table references with your actual source table paths
+--   3. Run each section in order (intermediate views must exist before finals)
+-- ============================================================================
+-- OUTPUT TABLES:
+--   ${catalog}.${schema}.LTE_ERC_NetAudit
+--   ${catalog}.${schema}.LTE_NOK_NetAudit
+--   ${catalog}.${schema}.NR_NOK_NetAudit
+--   ${catalog}.${schema}.NR_ERC_NetAudit
+-- ============================================================================
+
+
+-- ############################################################################
+-- SECTION 1: SHARED REFERENCE VIEW
+-- ############################################################################
+
+CREATE OR REPLACE VIEW ${catalog}.${schema}.v_pea_cma_reference
+AS
+SELECT
+  CAST(FIPS AS STRING)  AS FIPS,
+  PEA_,
+  PEA_Name
+FROM ${catalog}.${schema}.RMS_PEAs_CMAs;
+
+
+-- ############################################################################
+-- SECTION 2: LTE_ERC_NetAudit
+-- ############################################################################
+
+CREATE OR REPLACE TABLE ${catalog}.${schema}.LTE_ERC_NetAudit
+AS
+SELECT
+  EDMARKET,
+  MARKET,
+  BAND,
+  BBU_FA_CODE,
+  CALL_SIGN,
+  CELL_TYPE,
+  CAST(CAST(CMA AS INT) AS STRING)               AS CMA,
+  COUNTY,
+  DSS_NRCELL,
+  EARFCNDL,
+  EARFCNUL,
+  DUTYPE,
+  EUTRAN_CELL_FDD_ID,
+  FACE,
+  CAST(CAST(FIPS AS INT) AS STRING)               AS FIPS,
+  LATITUDE,
+  LONGITUDE,
+  ON_AIR,
+  REMOTE_USID,
+  RRU_LIST,
+  TAC,
+  USID,
+  REFRESH_DATE,
+  CAST(DL_CH_BW AS STRING)                        AS DL_CH_BW,
+  CONFIGUREDMAXTXPOWER,
+  MAXIMUMTRANSMISSIONPOWER,
+  CONCAT('POINT(', LONGITUDE, ' ', LATITUDE, ')') AS construct_geo_point
+FROM (
+  SELECT
+    EDMARKET, MARKET, BAND, BBU_FA_CODE, CALL_SIGN, CELL_TYPE,
+    CMA, COUNTY, DSS_NRCELL, EARFCNDL, EARFCNUL, DUTYPE,
+    EUTRAN_CELL_FDD_ID, FACE, FIPS, LATITUDE, LONGITUDE, ON_AIR,
+    REMOTE_USID, RRU_LIST, TAC, USID, REFRESH_DATE, DL_CH_BW,
+    CONFIGUREDMAXTXPOWER, MAXIMUMTRANSMISSIONPOWER,
+    ROW_NUMBER() OVER (PARTITION BY EUTRAN_CELL_FDD_ID ORDER BY EUTRAN_CELL_FDD_ID) AS _rn
+  FROM ${catalog}.${schema}.e_ndr_erk_lce8_nrb
+) t
+WHERE _rn = 1;
+
+
+-- ############################################################################
+-- SECTION 3: LTE_NOK_NetAudit
+-- ############################################################################
+
+CREATE OR REPLACE TABLE ${catalog}.${schema}.LTE_NOK_NetAudit
+AS
+SELECT * EXCEPT(_rn)
+FROM (
+  SELECT
+    l.EDMARKET,
+    l.MARKET,
+    l.USID,
+    l.ENBNAME,
+    l.BBU_CONFIG,
+    l.REMOTE_USID,
+    l.FACE,
+    l.LATITUDE,
+    l.LONGITUDE,
+    l.CELLNAME,
+    l.DSS_NRCELL,
+    l.CELL_TYPE,
+    l.ON_AIR,
+    l.BAND,
+    l.DL_CH_BW,
+    l.RRHTYPE,
+    l.EARFCNDL,
+    l.EARFCNUL,
+    l.TAC,
+    l.PMAX,
+    r.county,
+    CAST(CAST(r.fips AS INT) AS STRING)                     AS fips,
+    CAST(CAST(r.cma AS INT) AS STRING)                      AS cma,
+    CAST(r.pulldate AS STRING)                               AS pulldate,
+    CONCAT('POINT(', l.LONGITUDE, ' ', l.LATITUDE, ')')     AS construct_geo_point,
+    ROW_NUMBER() OVER (PARTITION BY l.CELLNAME ORDER BY l.CELLNAME) AS _rn
+  FROM ${catalog}.${schema}.e_ndr_nokia_lce8_nrb l
+  LEFT JOIN ${catalog}.${schema}.k_nok_5gnr_cell_nrb r
+    ON l.ENBNAME = r.enbname
+) t
+WHERE _rn = 1;
+
+
+-- ############################################################################
+-- SECTION 4: NR_NOK_NetAudit
+-- ############################################################################
+
+-- 4A. Latest nodesite records
+CREATE OR REPLACE VIEW ${catalog}.${schema}.v_nr_nok_nodesite_latest
+AS
+SELECT ns.*
+FROM ${catalog}.${schema}.nodesite_NRCELL ns
+WHERE ns.loaddate_ = (
+  SELECT MAX(loaddate_) FROM ${catalog}.${schema}.nodesite_NRCELL
+);
+
+-- 4B. Base Nokia NR cells (select + dedup + cast)
+CREATE OR REPLACE VIEW ${catalog}.${schema}.v_nr_nok_base
+AS
+SELECT * EXCEPT(_rn)
+FROM (
+  SELECT
+    MARKET, EDMARKET, NRCELL_NAME, DSS_LTECELL, CELL_TYPE,
+    ON_AIR, BAND, BW_DL, RRH_PRODUCTNAME, NRARFCN, CELLBARRED,
+    PHYSCELLID, LTE_CELLS_ON_SAME_RRH,
+    CAST(CAST(FIPS AS INT) AS STRING)   AS FIPS,
+    CAST(CAST(CMA AS INT) AS STRING)    AS CMA,
+    BBU_USID, CSS_SITE_NAME, BBU_CONFIG, GNB_NAME, REMOTE_USID,
+    FACE, LATITUDE, LONGITUDE, PMAX, RFS_DSS_FEATURESTATE, CPRI_LINK_RATE,
+    CAST(
+      DATE_FORMAT(
+        CAST(FROM_UNIXTIME(CAST(LOADDATE AS BIGINT) / 1000) AS DATE),
+        'yyyy-MM-dd'
+      ) AS STRING
+    ) AS LOADDATE,
+    CONCAT('POINT(', LONGITUDE, ' ', LATITUDE, ')') AS construct_geo_point,
+    ROW_NUMBER() OVER (PARTITION BY NRCELL_NAME ORDER BY NRCELL_NAME) AS _rn
+  FROM ${catalog}.${schema}.ERICSSONITE_NRCellBU
+) t
+WHERE _rn = 1;
+
+-- 4C. Final NR_NOK_NetAudit
+CREATE OR REPLACE TABLE ${catalog}.${schema}.NR_NOK_NetAudit
+AS
+SELECT * EXCEPT(_rn)
+FROM (
+  SELECT
+    b.FIPS,
+    b.CMA,
+    b.MARKET,
+    b.EDMARKET,
+    b.NRCELL_NAME,
+    b.DSS_LTECELL,
+    b.CELL_TYPE,
+    b.ON_AIR,
+    b.BAND,
+    b.BW_DL,
+    b.RRH_PRODUCTNAME,
+    b.NRARFCN,
+    b.CELLBARRED,
+    b.PHYSCELLID,
+    b.LTE_CELLS_ON_SAME_RRH,
+    b.BBU_USID,
+    b.CSS_SITE_NAME,
+    b.BBU_CONFIG,
+    b.GNB_NAME,
+    b.REMOTE_USID,
+    b.FACE,
+    b.LATITUDE,
+    b.LONGITUDE,
+    b.LOADDATE,
+    b.PMAX,
+    b.RFS_DSS_FEATURESTATE,
+    b.CPRI_LINK_RATE,
+    b.construct_geo_point,
+    n.node_,
+    n.pid_,
+    n.cellname,
+    n.lcrid,
+    p.PEA_,
+    p.PEA_Name,
+    ROW_NUMBER() OVER (PARTITION BY b.NRCELL_NAME ORDER BY b.NRCELL_NAME) AS _rn
+  FROM ${catalog}.${schema}.v_nr_nok_base b
+  LEFT JOIN ${catalog}.${schema}.v_nr_nok_nodesite_latest n
+    ON b.NRCELL_NAME = n.cellname
+  LEFT JOIN ${catalog}.${schema}.v_pea_cma_reference p
+    ON b.FIPS = p.FIPS
+  WHERE n.node_ IS NOT NULL AND TRIM(n.node_) != ''
+) t
+WHERE _rn = 1;
+
+
+-- ############################################################################
+-- SECTION 5: NR_ERC_NetAudit
+-- ############################################################################
+
+-- 5A. Latest SSB records
+CREATE OR REPLACE VIEW ${catalog}.${schema}.v_nr_erc_ssb_latest
+AS
+SELECT ssb.*
+FROM ${catalog}.${schema}.ERICSSONITE_SSB ssb
+WHERE ssb.LOADDATE_ = (
+  SELECT MAX(LOADDATE_) FROM ${catalog}.${schema}.ERICSSONITE_SSB
+);
+
+-- 5B. Active LEVO sectors
+CREATE OR REPLACE VIEW ${catalog}.${schema}.v_nr_erc_levo_active
+AS
+SELECT *
+FROM ${catalog}.${schema}.LEVO_SITE_MASTER_BR
+WHERE SOFT_SECTOR_ID > 0;
+
+-- 5C. Ericsson NR source with PEA
+CREATE OR REPLACE VIEW ${catalog}.${schema}.v_nr_erc_with_pea
+AS
+SELECT
+  src.edmarket,
+  src.market,
+  src.bbu_usid,
+  src.bbu_fa_code,
+  src.county,
+  CAST(CAST(src.fips AS INT) AS STRING)           AS fips,
+  CAST(CAST(src.cma AS INT) AS STRING)            AS cma,
+  src.remote_usid,
+  src.face,
+  src.latitude,
+  src.longitude,
+  src.nrcell_name,
+  src.cell_type,
+  src.on_air,
+  src.band,
+  src.bw_dl,
+  src.arfcndl,
+  src.arfcnul,
+  src.call_sign,
+  CAST(src.refresh_date AS STRING)                AS refresh_date,
+  src.gnb_name,
+  src.rru_name,
+  src.lte_cells_on_same_rru,
+  src.cpri_link_rate,
+  src.sw_name,
+  src.ems_name,
+  src.dss_ltecell,
+  src.cellbarred,
+  src.configuredmaxtxpower,
+  p.PEA_,
+  p.PEA_Name,
+  CONCAT(
+    COALESCE(src.nrcell_name, ''),
+    '-',
+    COALESCE(CAST(src.refresh_date AS STRING), '')
+  )                                                AS concat_prim,
+  CONCAT('POINT(', src.longitude, ' ', src.latitude, ')') AS construct_geo_point
+FROM ${catalog}.${schema}.k_FBRC_SCNR_CELL src
+LEFT JOIN ${catalog}.${schema}.v_pea_cma_reference p
+  ON CAST(CAST(src.fips AS INT) AS STRING) = p.FIPS;
+
+-- 5D. Final NR_ERC_NetAudit
+CREATE OR REPLACE TABLE ${catalog}.${schema}.NR_ERC_NetAudit
+AS
+SELECT
+  UUID()                AS uuid,
+  v.edmarket,
+  v.market,
+  v.bbu_usid,
+  v.bbu_fa_code,
+  v.county,
+  v.fips,
+  v.cma,
+  v.remote_usid,
+  v.face,
+  v.latitude,
+  v.longitude,
+  v.nrcell_name,
+  v.cell_type,
+  v.on_air,
+  v.band,
+  v.bw_dl,
+  v.arfcndl,
+  v.arfcnul,
+  v.call_sign,
+  v.refresh_date,
+  v.gnb_name,
+  v.rru_name,
+  v.lte_cells_on_same_rru,
+  v.cpri_link_rate,
+  v.sw_name,
+  v.ems_name,
+  v.dss_ltecell,
+  v.cellbarred,
+  v.configuredmaxtxpower,
+  v.PEA_,
+  v.PEA_Name,
+  v.concat_prim,
+  v.construct_geo_point,
+  ssb.SSBFREQUENCY,
+  ssb.SSBDURATION,
+  ssb.SSBOFFSET,
+  levo.CLLI,
+  levo.SITE_ID_NAME_BBU
+FROM ${catalog}.${schema}.v_nr_erc_with_pea v
+LEFT JOIN ${catalog}.${schema}.v_nr_erc_ssb_latest ssb
+  ON v.nrcell_name = ssb.NRCELLDU_ID_
+LEFT JOIN ${catalog}.${schema}.v_nr_erc_levo_active levo
+  ON v.nrcell_name = levo.SOFT_SECTOR_NAME;
+
+
+-- ############################################################################
+-- CLEANUP (optional): Drop intermediate views after tables are built
+-- ############################################################################
+-- DROP VIEW IF EXISTS ${catalog}.${schema}.v_pea_cma_reference;
+-- DROP VIEW IF EXISTS ${catalog}.${schema}.v_nr_nok_nodesite_latest;
+-- DROP VIEW IF EXISTS ${catalog}.${schema}.v_nr_nok_base;
+-- DROP VIEW IF EXISTS ${catalog}.${schema}.v_nr_erc_ssb_latest;
+-- DROP VIEW IF EXISTS ${catalog}.${schema}.v_nr_erc_levo_active;
+-- DROP VIEW IF EXISTS ${catalog}.${schema}.v_nr_erc_with_pea;
