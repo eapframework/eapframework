@@ -1,0 +1,229 @@
+name: lakeflow-design-pipelines
+description: "Creates, configures, and updates Databricks Lakeflow Designer pipelines. Pipelines are SQL constructs with metadata in comments for visual representation."
+---
+
+# SQL Visual Editor Pipeline Format
+
+## Documentation
+- [CTE Documentation](https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-syntax-qry-select-cte)
+
+## Format Requirements
+
+**CRITICAL**: The SQL Visual Editor requires a specific format:
+
+1. `CREATE OR REPLACE MATERIALIZED VIEW catalog.schema.table_name`
+2. `TBLPROPERTIES ('delta.columnMapping.mode' = 'name')`
+3. **`AS`** keyword (REQUIRED - without this you get subquery errors!)
+4. `WITH` clause containing CTEs (Common Table Expressions)
+5. Final `SELECT * FROM last_cte;`
+6. Node metadata in `/* nodes: ... */` comment block
+
+## Common Errors
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| "Your SQL is already valid as a CTE chain..." | Missing CREATE statement | Add `CREATE OR REPLACE MATERIALIZED VIEW` |
+| "Databricks SQL does not support subqueries in FROM clause with table aliases" | Missing `AS` keyword | Add `AS` after TBLPROPERTIES, before WITH |
+
+## Conversion Process
+
+When converting from Palantir Foundry JSON or other pipeline formats:
+1. Each transform step becomes a CTE
+2. Source tables become the first CTEs with `SELECT * FROM source_table`
+3. Transform operations (filter, join, aggregate) become subsequent CTEs
+4. Final output becomes the last CTE and SELECT
+5. Calculate x,y positions based on pipeline flow (left-to-right)
+6.
+Databricks SQL does not support CREATE OR REPLACE MATERIALIZED VIEW ... AS WITH (CTE). Convert this to CREATE OR REPLACE TABLE ... AS SELECT with all CTEs inlined as subqueries, 
+## Sample Code
+7. Do not add tblproper
+
+###example
+
+```sql
+CREATE OR REPLACE MATERIALIZED VIEW main.default.output_table
+TBLPROPERTIES ('delta.columnMapping.mode' = 'name')
+AS
+WITH copper_cable_segments AS (
+SELECT
+*
+FROM
+bp_telecom_demos.copper_reclamation.copper_cable_segments
+),
+coaxial_cable_segments AS (
+SELECT
+*
+FROM
+copper_cable_segments
+WHERE
+cable_type = 'Coaxial'
+),
+coaxial_cost_by_length_bucket AS (
+SELECT
+CASE
+WHEN length_meters < 500 THEN 'Under 500m'
+WHEN
+length_meters >= 500
+AND length_meters < 1500
+THEN
+'500-1499m'
+ELSE '1500m and above'
+END AS `length_bucket`,
+AVG(replacement_cost_usd) AS `avg_replacement_cost_usd`,
+MIN(replacement_cost_usd) AS `min_replacement_cost_usd`,
+MAX(replacement_cost_usd) AS `max_replacement_cost_usd`
+FROM
+coaxial_cable_segments
+GROUP BY
+length_bucket
+),
+coaxial_length_analysis AS (
+SELECT
+COUNT(*) AS `segment_count`,
+SUM(length_meters) AS `total_length_meters`,
+AVG(length_meters) AS `avg_length_meters`,
+MIN(length_meters) AS `min_length_meters`,
+MAX(length_meters) AS `max_length_meters`
+FROM
+coaxial_cable_segments
+),
+coaxial_length_buckets AS (
+SELECT
+CASE
+WHEN length_meters < 500 THEN 'Under 500m'
+WHEN
+length_meters >= 500
+AND length_meters < 1500
+THEN
+'500-1499m'
+ELSE '1500m and above'
+END AS `length_bucket`,
+COUNT(*) AS `segment_count`,
+SUM(length_meters) AS `total_length_meters`,
+AVG(length_meters) AS `avg_length_meters`
+FROM
+coaxial_cable_segments
+GROUP BY
+length_bucket
+),
+coaxial_length_distribution AS (
+SELECT
+length_meters,
+COUNT(*) AS segment_count
+FROM
+coaxial_cable_segments
+GROUP BY
+length_meters
+ORDER BY
+length_meters
+)
+SELECT
+*
+FROM
+coaxial_cost_by_length_bucket;
+
+/*
+nodes:
+copper_cable_segments:
+x: 778
+y: 394.5
+dimensions:
+width: 180
+height: 95
+nodeId: 347f497e-fb61-4baa-98d1-0a38bf901c92
+type: Source
+description:
+text: Retrieve all data from copper cable segments.
+hash: 0dbf8d34
+coaxial_cable_segments:
+x: 1012
+y: 394.5
+dimensions:
+width: 180
+height: 95
+nodeId: 9b3aee10-d4da-42a4-8acf-549b757eeeaa
+description:
+text: Filter to coaxial cable type.
+hash: 8c5e51a6
+coaxial_cost_by_length_bucket:
+x: 1246
+y: 104.5
+dimensions:
+width: 180
+height: 95
+nodeId: 979a57cd-7616-4f37-a2a2-6c4b90496948
+description:
+text: Group cables by length ranges and calculate average, minimum, and maximum
+replacement costs for each group.
+hash: bdb84b1d
+coaxial_length_analysis:
+x: 1246
+y: 394.5
+dimensions:
+width: 180
+height: 95
+nodeId: 400917b3-016e-4320-9cd1-db395f1d7c3c
+description:
+text: Calculate count, total, average, minimum, and maximum of cable segment
+lengths.
+hash: b388784b
+coaxial_length_buckets:
+x: 1246
+y: 249.5
+dimensions:
+width: 180
+height: 95
+nodeId: 0b2a6741-27f0-4c50-9526-8a5ef5680d0e
+description:
+text: Group cable segments by length ranges and calculate count, total length,
+and average length for each group.
+hash: d2b92e61
+coaxial_length_distribution:
+x: 1246
+y: 539.5
+dimensions:
+width: 180
+height: 95
+nodeId: ce0dc3dd-6924-4e94-8d7f-fbae2f896fb6
+description:
+text: Count cable segments by their length and sort by length.
+hash: ff9af8d5
+main.default.output_table:
+x: 1480
+y: 104.5
+dimensions:
+width: 180
+height: 95
+nodeId: 97ea9324-7ac5-496f-9d0e-b54ee5667a86
+type: Output
+description:
+text: Calculate average, minimum, and maximum replacement costs for coaxial
+cables grouped by length ranges.
+hash: "77010276"
+*/
+```
+
+## Node Metadata Format
+
+Each CTE should have a corresponding node entry in the metadata comment:
+
+```yaml
+nodes:
+cte_name:
+x: <horizontal position>
+y: <vertical position>
+dimensions:
+width: 180
+height: 95
+nodeId: <uuid>
+type: Source | Output # only for source/output nodes
+description:
+text: <description of what this step does>
+hash: <8-char hex hash>
+```
+
+### Positioning Guidelines
+- Sources: leftmost (x ~ 100-400)
+- Transforms: middle, staggered by dependency (x increases by ~250 per step)
+- Outputs: rightmost (x ~ 1500+)
+- Vertical spacing: ~150 between nodes
