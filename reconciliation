@@ -1,0 +1,68 @@
+FOUNDRY_FQDN = "paloma.palantirfoundry.com"
+
+from pypalantir_core import FoundryClient
+
+from pypalantir_operations import rid_for_path as getDatasetRid
+
+
+
+
+def loadDataframe(datasetPath, token):
+
+  client = FoundryClient(host='https://{}'.format(FOUNDRY_FQDN), token=token)
+
+  return spark.read.parquet('foundry://{}@{}/datasets/{}/views/master/files/*'.format(token, FOUNDRY_FQDN, getDatasetRid(client, datasetPath)))
+
+ 
+
+TOKEN = ".N8JwOlEbtCGjDaCwal2POlbL4_Lg2BxEnz6fkbgVH_1UbPvvN2E9BERlOBGp6jmDnvrHB0UIPFx14y6JA-n20A"
+
+ 
+
+ 
+
+ 
+
+=========================================================
+
+from pyspark.sql.functions import sum,avg,max,count
+
+from pyspark.sql import functions as F, Window
+
+# read latest view a the dataset on branch master and preview 10 rows
+
+df_deep = loadDataframe("/Innovation Lab/[Source] Azure DL GAIM/data/clean/g_dispute", TOKEN)
+
+#df_deep = df_deep.limit(1)
+
+#df.show()
+
+df_deep_cnt=df_deep.count()
+
+print(df_deep_cnt,"Deep_Count")
+
+ 
+
+#df_azure = spark.read.format("parquet").load("abfss://gaim-stg@datalakeeastus2prd.dfs.core.windows.net/g_dispute/data_dt=20221115")
+
+df_azure = spark.read.format("parquet").load("abfss://gaim-stg@datalakeeastus2prd.dfs.core.windows.net/g_dispute/")
+
+#df_azure_cnt=df_azure.groupBy("data_dt") \
+
+#    .agg(count("*").alias("count")) \
+
+#    .show(truncate=False)
+
+w = (Window.partitionBy("data_dt").orderBy(F.col("data_dt").cast("long"))
+
+     .rangeBetween(-30 * 86400, -1) # 86400 = number of second in a day
+
+     )
+
+result = (df_azure.withColumn("recordcounts_in_last_30_days", F.count("*").over(w))
+
+          )
+
+print(result)
+
+ 
