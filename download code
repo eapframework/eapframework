@@ -1,0 +1,131 @@
+import requests
+import json
+from transforms.api import transform, Output, Input
+
+@transform(
+    input_table=Input("ri.foundry.main.dataset.6cbeedb1-a8c8-4145-a87c-f707db870fad"),
+    output=Output("/Innovation Lab/[Source] DEEP_INGESTION/logic/datasets/Next/DEEP_CODE"),
+)
+def compute(input_table, output):
+    df = input_table.dataframe().toPandas()
+
+    token = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiIveXFzeEdsN1FodWVRc291cFpkcW1RPT0iLCJqdGkiOiJLTGE3YXpmY1NUS0dkdzlReFQ5RElRPT0ifQ.AkoEH8rVvWnubdvAIMCqMIC-MZpIIHKhIlyKrrRrC0grjvYClIoG8ZjFNMDVSccjwnMWNdrnsKXxA1ym2Cel5Q"
+    branch = "master"
+    code_url = "https://paloma.palantirfoundry.com/monocle/api/table/code2"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}",
+        "content-type": "application/json"
+    }
+
+    for idx, row in df.iterrows():
+        table_id = row["incoming_rid"]
+        resource_id = row.get("resource_id", "")
+        resource_type = row.get("resource_type", "")
+        node_id = row.get("node_id", None)
+
+        # Skip UploadedDataset and FusionSheet
+        if resource_type in ("UploadedDataset", "FusionSheet"):
+            continue
+
+        # PIPELINE BUILDER LOGIC
+        if resource_type == "PipelineBuilder" and resource_id:
+            try:
+                sandbox_url = f"https://paloma.palantirfoundry.com/eddie/api/pipelines-v2/{resource_id}/sandboxes/get/all"
+                sandbox_resp = requests.get(sandbox_url, headers=headers)
+                sandbox_resp.raise_for_status()
+                sandbox_json = sandbox_resp.json()
+                sandboxes = sandbox_json.get("sandboxes", [])
+                if not sandboxes:
+                    raise Exception("No sandboxes found for pipeline builder resource.")
+                sandbox_id = sandboxes[0].get("id")
+                if not sandbox_id:
+                    raise Exception("No sandbox id found in sandboxes.")
+
+                info_url = f"https://paloma.palantirfoundry.com/eddie/api/pipelines-v2/{resource_id}/all-information?sandboxId={sandbox_id}"
+                info_resp = requests.get(info_url, headers=headers)
+                info_resp.raise_for_status()
+                info_json = info_resp.json()
+
+                output_file_name = f"PIPELINE_{resource_id}_{table_id}.json"
+                with output.filesystem().open(output_file_name, "w") as f:
+                    json.dump(info_json, f, indent=2)
+            except Exception as e:
+                output_file_name = f"PIPELINE_{resource_id}_{table_id}_REQUEST_ERROR.json"
+                with output.filesystem().open(output_file_name, "w") as f:
+                    json.dump({"error": str(e)}, f, indent=2)
+            continue  # Skip the rest of the loop for pipeline builder
+
+        # CONTOUR APP LOGIC
+        if resource_type == "Contour" and resource_id:
+            try:
+                analyses_url = f"https://paloma.palantirfoundry.com/contour/api/analyses/{resource_id}"
+                analyses_resp = requests.get(analyses_url, headers=headers)
+                analyses_resp.raise_for_status()
+                analyses_json = analyses_resp.json()
+                ref_rid = analyses_json["refs"][0]["rid"]
+
+                saved_dataset_url = f"https://paloma.palantirfoundry.com/contour/api/datasets/refs/{ref_rid}/saved-dataset"
+                saved_dataset_resp = requests.get(saved_dataset_url, headers=headers)
+                saved_dataset_resp.raise_for_status()
+                saved_dataset_json = saved_dataset_resp.json()
+                node_id_val = saved_dataset_json["nodeId"]["id"]
+                dataset_id_rid = saved_dataset_json["datasetId"]["rid"]
+                dataset_name = saved_dataset_json["datasetName"]
+
+                board_url = f"https://paloma.palantirfoundry.com/contour/api/refs/{ref_rid}/nodes/{node_id_val}/board"
+                board_resp = requests.get(board_url, headers=headers)
+                board_resp.raise_for_status()
+                board_json = board_resp.json()
+
+                output_file_name = f"CONTOUR_{resource_id}_{node_id_val}_{dataset_id_rid}_{dataset_name}.json"
+                with output.filesystem().open(output_file_name, "w") as f:
+                    json.dump(board_json, f, indent=2)
+            except Exception as e:
+                output_file_name = f"CONTOUR_{resource_id}_REQUEST_ERROR.json"
+                with output.filesystem().open(output_file_name, "w") as f:
+                    json.dump({"error": str(e)}, f, indent=2)
+            continue  # Skip the rest of the loop for contour app
+
+        # Only process PythonTransformation in the default logic
+        if resource_type not in ("Transform", "RawDataset"):
+            continue
+
+        # DEFAULT LOGIC (CODE, ERROR HANDLING)
+        payload = {
+            "tableId": table_id,
+            "branch": branch,
+            "fallbackBranches": []
+        }
+        try:
+            response = requests.post(code_url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            output_file_name = f"{table_id}_REQUEST_ERROR.json"
+            with output.filesystem().open(output_file_name, "w") as f:
+                json.dump({"error": str(e)}, f, indent=2)
+            continue
+
+        if "errorCode" in data:
+            error_code = data.get("errorCode", "ERROR")
+            output_file_name = f"{table_id}_{error_code}.json"
+            with output.filesystem().open(output_file_name, "w") as f:
+                json.dump(data, f, indent=2)
+            continue
+
+        code_repo_rid = None
+        if data.get("stemmaCode") and isinstance(data["stemmaCode"], dict):
+            code_repo_rid = data["stemmaCode"].get("codeRepoRid")
+        code_repo_rid_suffix = f"_{code_repo_rid}" if code_repo_rid else ""
+
+        if data.get("type") == "magritteExtract":
+            output_file_name = f"RAWDATASET_{table_id}{code_repo_rid_suffix}.json"
+            with output.filesystem().open(output_file_name, "w") as f:
+                json.dump(data, f, indent=2)
+        else:
+            stemma_code = data.get("stemmaCode", {})
+            python_code = stemma_code.get("jobSpecCode") or stemma_code.get("latestCode") or ""
+            output_file_name = f"TRANSFORM_{table_id}{code_repo_rid_suffix}.py"
+            with output.filesystem().open(output_file_name, "w") as f:
+                f.write(python_code)
